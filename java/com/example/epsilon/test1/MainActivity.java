@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.hardware.usb.UsbConstants;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbEndpoint;
@@ -29,6 +30,8 @@ public class MainActivity extends AppCompatActivity {
     private UsbDevice mUsbDevice = null;
     private UsbDeviceConnection mConnection = null;
     private UsbInterface mInterface = null;
+    private UsbEndpoint mEndpointOut = null;
+    private UsbEndpoint mEndpointIn = null;
 
     private static int TIMEOUT = 0;
     private boolean forceClaim = true;
@@ -42,28 +45,23 @@ public class MainActivity extends AppCompatActivity {
                 synchronized (this) {
                     UsbDevice device = (UsbDevice)intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
                     if(device == null) return;
-                    if(!is_ibadge(device)) return;
+                    if(!isMyDevice(device)) return;
 
-                    if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
-                        unregisterReceiver(mUsbReceiver);
+                    if(intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)){
                         mIsGranted = true;
+                        device_connect();
                     }
-                    else {
+                    else{
                         Log.d("check_permission", "permission denied for device " + device);
                     }
                 }
             }
-        }
-    };
-
-    BroadcastReceiver mUsbDetachedReceiver = new BroadcastReceiver() {
-        public void onReceive(Context context, Intent intent) {
-            String action = intent.getAction();
             if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
                 UsbDevice device = (UsbDevice)intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
                 if(device == null) return;
-                if(!is_ibadge(device)) return;
+                if(!isMyDevice(device)) return;
                 device_disconnect();
+                mUsbDevice = null;
             }
         }
     };
@@ -81,31 +79,65 @@ public class MainActivity extends AppCompatActivity {
             public void onClick(View view) {
                 Snackbar.make(view, "Replace with your own action", Snackbar.LENGTH_LONG)
                         .setAction("Action", null).show();
-                device_connect();
+
+                if(mConnection == null) return;
+                if(mEndpointIn == null || mEndpointOut == null) return;
+
+                byte[] command = new byte[]{(byte)0x55, (byte)0x53, (byte)0x42, (byte)0x43,
+                        (byte)0x80, (byte)0xa8, (byte)0xa2, (byte)0x86,
+                        (byte)0x0a, (byte)0x00, (byte)0x00, (byte)0x00,
+                        (byte)0x80, (byte)0x00, (byte)0x0c, (byte)0x00,
+                        (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
+                        (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
+                        (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
+                        (byte)0x00, (byte)0x00, (byte)0x00};
+
+                int outLen = mConnection.bulkTransfer(mEndpointOut, command, command.length, TIMEOUT);
+                if(outLen < 0){
+                    throw new IllegalArgumentException("bulkTransfer out error");
+                }
+
+                int maxPacketSize = mEndpointIn.getMaxPacketSize();
+                byte[] buffer = new byte[maxPacketSize];
+                byte b0 = buffer[0];
+                int inLen = mConnection.bulkTransfer(mEndpointIn, buffer, maxPacketSize, TIMEOUT);
+                if(inLen < 0){
+                    throw new IllegalArgumentException("bulkTransfer in error");
+                }
+                b0 = buffer[0];
             }
         });
 
         mUsbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
 
-
-
         Intent intent = getIntent();
         if (intent != null) {
             Log.d("onResume", "intent: " + intent.toString());
             if (intent.getAction().equals(UsbManager.ACTION_USB_DEVICE_ATTACHED)) {
-                mUsbDevice = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
-                // assume permission granted
-                mIsGranted = true;
-                return;
+                UsbDevice device  = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                if(device != null && isMyDevice(device)) {
+                    mUsbDevice = device;
+                }
             }
         }
 
-        if(has_device()){
-            registerReceiver(mUsbReceiver, new IntentFilter(ACTION_USB_PERMISSION));
-            PendingIntent permissionIntent = PendingIntent.getBroadcast(this, 0, new Intent(ACTION_USB_PERMISSION), 0);
-            mUsbManager.requestPermission(mUsbDevice, permissionIntent);
+        if(mUsbDevice != null || has_device()) {
+
+            IntentFilter intentFilter = new IntentFilter();
+            intentFilter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+            intentFilter.addAction(ACTION_USB_PERMISSION);
+            registerReceiver(mUsbReceiver, intentFilter);
+
+            if (mUsbManager.hasPermission(mUsbDevice)) {
+                mIsGranted = true;
+                device_connect();
+            } else {
+                PendingIntent permissionIntent = PendingIntent.getBroadcast(this, 0, new Intent(ACTION_USB_PERMISSION), 0);
+                mUsbManager.requestPermission(mUsbDevice, permissionIntent);
+            }
         }
         else{
+            mUsbDevice = null;
             Log.d("onCreate", "Usb Device not found");
         }
     }
@@ -113,17 +145,16 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        registerReceiver(mUsbDetachedReceiver, new IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED));
     }
 
     @Override
     protected void onPause(){
-        unregisterReceiver(mUsbDetachedReceiver);
         super.onPause();
     }
 
     @Override
     protected  void onDestroy(){
+        if(mUsbDevice != null) unregisterReceiver(mUsbReceiver);
         device_disconnect();
         super.onDestroy();
     }
@@ -134,7 +165,7 @@ public class MainActivity extends AppCompatActivity {
         Iterator<UsbDevice> deviceIterator = deviceList.values().iterator();
         while(deviceIterator.hasNext()){
             UsbDevice device = deviceIterator.next();
-            if (is_ibadge(device)) {
+            if (isMyDevice(device)) {
                 mUsbDevice = device;
                 return true;
             }
@@ -142,28 +173,50 @@ public class MainActivity extends AppCompatActivity {
         return false;
     }
 
-    private boolean is_ibadge(UsbDevice device){
+    private boolean isMyDevice(UsbDevice device){
         return device.getVendorId()==2323 && device.getProductId()==14112;
     }
 
     private void device_disconnect(){
+        if(mUsbDevice == null) return;
         if(mInterface == null) return;
         if(mConnection == null) return;
         mConnection.releaseInterface(mInterface);
         mConnection.close();
+        mInterface = null;
+        mConnection = null;
     }
 
     private void device_connect() {
+        if(mUsbManager == null) return;
         if(mUsbDevice == null) return;
-        if(mIsGranted == false) return;
+        if(! mIsGranted ) return;
         Log.d("device_connect", "USB device attached: name: " + mUsbDevice.getDeviceName());
 
-        byte[] bytes = new byte[]{0x00, 0x00, 0x00, 0x00};
         mInterface = mUsbDevice.getInterface(0);
-        UsbEndpoint endpoint = mInterface.getEndpoint(0);
         mConnection = mUsbManager.openDevice(mUsbDevice);
-        mConnection.claimInterface(mInterface, forceClaim);
-        mConnection.bulkTransfer(endpoint, bytes, bytes.length, TIMEOUT);
+        if(mConnection == null){
+            throw new IllegalArgumentException("UsbManager openDevice fail");
+        }
+        if(! mConnection.claimInterface(mInterface, forceClaim)){
+            throw new IllegalArgumentException("Connection claimInterface fail");
+        }
+
+        // look for our bulk endpoints
+        int endpointCount = mInterface.getEndpointCount();
+        for (int i = 0; i < endpointCount; i++) {
+            UsbEndpoint ep = mInterface.getEndpoint(i);
+            if (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                if (ep.getDirection() == UsbConstants.USB_DIR_OUT) {
+                    mEndpointOut = ep;
+                } else {
+                    mEndpointIn = ep;
+                }
+            }
+        }
+        if (mEndpointOut == null || mEndpointIn == null) {
+            throw new IllegalArgumentException("not all endpoints found");
+        }
     }
 
     @Override
